@@ -6,12 +6,15 @@ from __future__ import annotations
 
 import argparse
 import base64
+import ctypes
 import getpass
 import json
 import os
 import random
 import sys
 import time
+import threading
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable
@@ -21,7 +24,9 @@ import requests
 from bs4 import BeautifulSoup
 from Crypto.Cipher import PKCS1_v1_5
 from Crypto.PublicKey import RSA
+from rich.align import Align
 from rich.console import Console
+from rich.console import Group
 from rich.live import Live
 from rich.panel import Panel
 from rich.prompt import Confirm, Prompt
@@ -35,9 +40,11 @@ LOGIN_PATH = "/jwglxt/xtgl/login_slogin.html"
 COURSE_INDEX_PATH = "/jwglxt/xsxk/zzxkyzb_cxZzxkYzbIndex.html"
 CART_PATH = "/jwglxt/xsxk/zzxkyzb_cxWdgwcZzxkYzb.html"
 SUBMIT_PATH = "/jwglxt/xsxk/zzxkyzbjk_xkBcZyZzxkYzbFromCart.html"
+APP_VERSION = "SCAU-course-tool_v2.5"
 
 DEFAULT_CONFIG: dict[str, Any] = {
     "duration_seconds": 600,
+    "max_workers": 3,
     "speed_profile": "medium",
     "speed_profiles": {
         "ultra_fast": 0.01,
@@ -104,6 +111,7 @@ class SniperError(RuntimeError):
 @dataclass
 class Config:
     duration_seconds: int
+    max_workers: int
     speed_profile: str
     speed_profiles: dict[str, float]
 
@@ -162,9 +170,20 @@ def load_config(path: Path) -> Config:
                 data[key] = value
     return Config(
         duration_seconds=int(data["duration_seconds"]),
+        max_workers=parse_max_workers(data.get("max_workers", 3)),
         speed_profile=str(data["speed_profile"]),
         speed_profiles={k: float(v) for k, v in data["speed_profiles"].items()},
     )
+
+
+def parse_max_workers(value: Any) -> int:
+    try:
+        workers = int(value)
+    except (TypeError, ValueError) as exc:
+        raise SniperError("并发线程 max_workers 必须是 1-6 的整数。") from exc
+    if workers < 1 or workers > 6:
+        raise SniperError("并发线程 max_workers 必须在 1-6 之间。")
+    return workers
 
 
 def b64decode_lenient(value: str) -> bytes:
@@ -415,6 +434,13 @@ class ScauClient:
         if referer:
             headers["Referer"] = referer
         return headers
+
+    def clone_for_worker(self) -> "ScauClient":
+        worker = ScauClient(base_url=self.base_url, timeout=self.timeout)
+        worker.course_context = dict(self.course_context)
+        worker.session.headers.update(self.session.headers)
+        worker.session.cookies.update(self.session.cookies.copy())
+        return worker
 
     def login(self, username: str, password: str) -> None:
         login_url = self.url(LOGIN_PATH)
@@ -756,11 +782,54 @@ def build_course_table(courses: list[CartCourse], show_status: bool = False) -> 
 def build_live_panel(courses: list[CartCourse], end_time: float, profile: str) -> Panel:
     remaining = max(0, int(end_time - time.monotonic()))
     active = sum(1 for course in courses if course.active)
-    title = f"抢课中 | 档位 {profile} | 剩余 {remaining}s | 活跃 {active}"
+    title = Text("抢课中 | 档位 ")
+    title.append(profile, style=speed_profile_style(profile))
+    title.append(f" | 剩余 {remaining}s | 活跃 {active}")
     return Panel(build_course_table(courses, show_status=True), title=title, border_style="cyan")
 
 
+def speed_profile_style(profile: str) -> str:
+    styles = {
+        "ultra_fast": "bold red",
+        "fast": "bold yellow",
+        "medium": "bold cyan",
+        "slow": "green",
+    }
+    return styles.get(profile, "magenta")
+
+
+def build_config_panel(config: Config, config_path: Path) -> Panel:
+    speed_line = Text("速度档位: ")
+    speed_line.append(config.speed_profile, style=speed_profile_style(config.speed_profile))
+    speed_line.append(f" ({config.interval_seconds}s/请求)")
+    body = Group(
+        Align.center(Text(APP_VERSION, style="bold cyan")),
+        Text(f"持续时间: {config.duration_seconds}s"),
+        speed_line,
+        Text(f"并发线程: {config.max_workers}"),
+        Text(f"配置文件: {config_path}"),
+    )
+    return Panel.fit(body, title="配置", border_style="cyan")
+
+
+WORKER_STATE = threading.local()
+
+
+def submit_course_with_worker_client(source_client: ScauClient, course: CartCourse) -> SubmitResult:
+    worker_client = getattr(WORKER_STATE, "client", None)
+    if worker_client is None:
+        worker_client = source_client.clone_for_worker()
+        WORKER_STATE.client = worker_client
+    return worker_client.submit_course(course)
+
+
 def prompt_full_course(course: CartCourse, console: Console) -> bool:
+    message = f"{safe_course_line(course)}\n返回原因: {course.last_message}\n\n是否继续抢这门课捡漏？"
+    if os.name == "nt":
+        yes = 6
+        flags = 0x00000004 | 0x00000020 | 0x00040000  # MB_YESNO | MB_ICONQUESTION | MB_TOPMOST
+        return ctypes.windll.user32.MessageBoxW(None, message, "课程容量提示", flags) == yes
+
     console.print()
     console.print(Panel.fit(
         f"{safe_course_line(course)}\n返回原因: {course.last_message}",
@@ -772,62 +841,156 @@ def prompt_full_course(course: CartCourse, console: Console) -> bool:
 
 def run_sniper(client: ScauClient, courses: list[CartCourse], config: Config, console: Console) -> None:
     interval = config.interval_seconds
+    max_workers = config.max_workers
     end_time = time.monotonic() + config.duration_seconds
     spinner_frames = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
     spin_index = 0
+    course_cursor = 0
+    next_submit_at = 0.0
+    in_flight: dict[Future, CartCourse] = {}
+    in_flight_by_course: dict[str, int] = {}
+    full_waiting_courses: set[str] = set()
+    prompting_courses: set[str] = set()
+    prompt_futures: dict[Future, CartCourse] = {}
 
-    with Live(build_live_panel(courses, end_time, config.speed_profile), console=console, refresh_per_second=4) as live:
+    def course_key(course: CartCourse) -> str:
+        return course.cart_id
+
+    def pick_next_course() -> CartCourse | None:
+        nonlocal course_cursor
+        if not courses:
+            return None
+        for _ in range(len(courses)):
+            course = courses[course_cursor % len(courses)]
+            course_cursor += 1
+            key = course_key(course)
+            if course.active and not course.success and key not in full_waiting_courses and key not in prompting_courses:
+                return course
+        return None
+
+    def handle_submit_result(future: Future) -> None:
+        course = in_flight.pop(future)
+        key = course_key(course)
+        in_flight_by_course[key] = max(0, in_flight_by_course.get(key, 1) - 1)
         try:
-            while time.monotonic() < end_time and any(course.active for course in courses):
-                for course in courses:
-                    if time.monotonic() >= end_time:
-                        break
-                    if not course.active:
-                        continue
+            result = future.result()
+        except Exception as exc:
+            result = SubmitResult("retry", f"线程异常: {exc.__class__.__name__}")
 
-                    course.attempts += 1
-                    course.status = f"提交中 {spinner_frames[spin_index % len(spinner_frames)]}"
-                    spin_index += 1
+        if result.category == "auth_expired":
+            course.last_message = result.message
+            course.status = "登录失效"
+            raise SniperError(result.message)
+
+        if course.success:
+            return
+
+        if result.category == "success":
+            course.last_message = result.message
+            course.status = "成功"
+            course.success = True
+            course.active = False
+            full_waiting_courses.discard(key)
+        elif result.category == "full":
+            course.last_message = result.message
+            course.status = "满课/等待确认"
+            full_waiting_courses.add(key)
+        elif key in full_waiting_courses:
+            course.status = "满课/等待确认"
+        elif result.category == "retry":
+            course.last_message = result.message
+            course.status = "重试中"
+        else:
+            course.last_message = result.message
+            course.status = "业务停止"
+            course.active = False
+
+    def handle_prompt_result(future: Future) -> None:
+        course = prompt_futures.pop(future)
+        key = course_key(course)
+        prompting_courses.discard(key)
+        full_waiting_courses.discard(key)
+        try:
+            keep_trying = bool(future.result())
+        except Exception as exc:
+            course.last_message = f"满课确认窗口异常，默认继续: {exc.__class__.__name__}"
+            keep_trying = True
+
+        if course.success:
+            return
+        if keep_trying and time.monotonic() < end_time:
+            course.status = "继续捡漏"
+            course.active = True
+        else:
+            course.status = "已暂停"
+            course.active = False
+
+    def launch_ready_prompts(prompt_executor: ThreadPoolExecutor) -> None:
+        if time.monotonic() >= end_time:
+            return
+        for course in courses:
+            key = course_key(course)
+            if (
+                key in full_waiting_courses
+                and key not in prompting_courses
+                and in_flight_by_course.get(key, 0) == 0
+                and course.active
+                and not course.success
+            ):
+                course.status = "等待弹窗确认"
+                prompting_courses.add(key)
+                prompt_futures[prompt_executor.submit(prompt_full_course, course, console)] = course
+
+    def dispatch_ready_submissions(executor: ThreadPoolExecutor) -> None:
+        nonlocal next_submit_at, spin_index
+        while len(in_flight) < max_workers and time.monotonic() < end_time:
+            now = time.monotonic()
+            if interval and now < next_submit_at:
+                return
+
+            course = pick_next_course()
+            if course is None:
+                return
+
+            key = course_key(course)
+            course.attempts += 1
+            course.status = f"提交中 {spinner_frames[spin_index % len(spinner_frames)]}"
+            spin_index += 1
+            in_flight_by_course[key] = in_flight_by_course.get(key, 0) + 1
+            future = executor.submit(submit_course_with_worker_client, client, course)
+            in_flight[future] = course
+            next_submit_at = time.monotonic() + interval
+            if interval:
+                return
+
+    with ThreadPoolExecutor(max_workers=max_workers) as submit_executor, ThreadPoolExecutor(max_workers=1) as prompt_executor:
+        with Live(build_live_panel(courses, end_time, config.speed_profile), console=console, refresh_per_second=4) as live:
+            try:
+                while (
+                    (time.monotonic() < end_time and any(course.active for course in courses))
+                    or in_flight
+                    or prompt_futures
+                ):
+                    for future in [item for item in in_flight if item.done()]:
+                        handle_submit_result(future)
+                    for future in [item for item in prompt_futures if item.done()]:
+                        handle_prompt_result(future)
+
+                    launch_ready_prompts(prompt_executor)
+                    dispatch_ready_submissions(submit_executor)
                     live.update(build_live_panel(courses, end_time, config.speed_profile))
 
-                    result = client.submit_course(course)
-                    course.last_message = result.message
-
-                    if result.category == "success":
-                        course.status = "成功"
-                        course.success = True
-                        course.active = False
-                    elif result.category == "full":
-                        course.status = "满课/容量满"
-                        live.update(build_live_panel(courses, end_time, config.speed_profile))
-                        live.stop()
-                        keep_trying = prompt_full_course(course, console)
-                        live.start(refresh=True)
-                        if keep_trying:
-                            course.status = "继续捡漏"
-                            course.active = True
-                        else:
-                            course.status = "已暂停"
-                            course.active = False
-                    elif result.category == "retry":
-                        course.status = "重试中"
-                    elif result.category == "auth_expired":
-                        course.status = "登录失效"
-                        raise SniperError(result.message)
-                    else:
-                        course.status = "业务停止"
-                        course.active = False
-
-                    live.update(build_live_panel(courses, end_time, config.speed_profile))
+                    sleep_seconds = 0.03
                     if interval:
-                        time.sleep(interval)
-        except KeyboardInterrupt:
-            for course in courses:
-                if course.active:
-                    course.status = "用户停止"
-                    course.active = False
-            live.update(build_live_panel(courses, end_time, config.speed_profile))
-            console.print("\n已收到 Ctrl+C，正在汇总当前状态。")
+                        sleep_seconds = min(sleep_seconds, max(0.005, next_submit_at - time.monotonic()))
+                    time.sleep(sleep_seconds)
+            except KeyboardInterrupt:
+                for course in courses:
+                    if course.active:
+                        course.status = "用户停止"
+                        course.active = False
+                live.update(build_live_panel(courses, end_time, config.speed_profile))
+                console.print("\n已收到 Ctrl+C，正在汇总当前状态。")
 
 
 def print_summary(courses: list[CartCourse], console: Console) -> None:
@@ -859,14 +1022,7 @@ def main(argv: list[str] | None = None) -> int:
 
         config_path = Path(args.config) if args.config else default_config_path()
         config = load_config(config_path)
-        console.print(Panel.fit(
-            f"持续时间: {config.duration_seconds}s\n"
-            f"速度档位: {config.speed_profile} ({config.interval_seconds}s/请求)\n"
-            f"配置文件: {config_path}\n"
-            "SCAU-course-tool_v2.0",
-            title="配置",
-            border_style="cyan",
-        ))
+        console.print(build_config_panel(config, config_path))
 
         username = Prompt.ask("请输入学号/账号", console=console)
         password = Prompt.ask("请输入密码", console=console, password=False)
@@ -963,7 +1119,18 @@ def run_self_test(console: Console) -> None:
     assert classify_submit_response([{"flag": "0", "msg": "时间冲突"}]).category == "stop"
     assert classify_submit_response(None, 500).category == "retry"
 
-    console.print("[green]本地自检通过：RSA、重复字段、购物车解析、结果分类均正常。[/green]")
+    assert parse_max_workers(1) == 1
+    assert parse_max_workers(3) == 3
+    assert parse_max_workers(6) == 6
+    for invalid_workers in (0, 7, "abc"):
+        try:
+            parse_max_workers(invalid_workers)
+        except SniperError:
+            pass
+        else:
+            raise AssertionError(f"max_workers should reject {invalid_workers!r}")
+
+    console.print("[green]本地自检通过：RSA、重复字段、购物车解析、结果分类、线程配置均正常。[/green]")
 
 
 if __name__ == "__main__":
